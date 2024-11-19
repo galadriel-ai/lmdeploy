@@ -18,15 +18,16 @@ from lmdeploy.messages import (GenerationConfig, LogitsProcessor,
                                PytorchEngineConfig, TurbomindEngineConfig)
 from lmdeploy.model import ChatTemplateConfig
 from lmdeploy.serve.async_engine import AsyncEngine
+from lmdeploy.serve.async_engine import StreamingToolState
 from lmdeploy.serve.openai.protocol import (  # noqa: E501
     ChatCompletionRequest, ChatCompletionResponse,
     ChatCompletionResponseChoice, ChatCompletionResponseStreamChoice,
     ChatCompletionStreamResponse, ChatCompletionTokenLogprob, ChatMessage,
     ChoiceLogprobs, CompletionRequest, CompletionResponse,
     CompletionResponseChoice, CompletionResponseStreamChoice,
-    CompletionStreamResponse, DeltaMessage, EmbeddingsRequest, EncodeRequest,
-    EncodeResponse, ErrorResponse, FunctionResponse, GenerateRequest,
-    GenerateResponse, LogProbs, ModelCard, ModelList, ModelPermission,
+    CompletionStreamResponse, DeltaFunctionCall, DeltaMessage, DeltaToolCall, 
+    EmbeddingsRequest, EncodeRequest, EncodeResponse, ErrorResponse, FunctionResponse, 
+    GenerateRequest, GenerateResponse, LogProbs, ModelCard, ModelList, ModelPermission,
     ToolCall, TopLogprob, UsageInfo)
 from lmdeploy.tokenizer import DetokenizeState, Tokenizer
 from lmdeploy.utils import get_logger
@@ -399,9 +400,9 @@ async def chat_completions_v1(request: ChatCompletionRequest,
     tools = None
     if request.tools and request.tool_choice != 'none':
         gen_config.skip_special_tokens = False
-        if request.stream is True:
-            logger.warning('Set stream to False for tools')
-            request.stream = False
+        #if request.stream is True:
+        #    logger.warning('Set stream to False for tools')
+        #    request.stream = False
         # internlm2 only uses contents inside function regardless of 'type'
         if not isinstance(request.tool_choice, str):
             tools = [
@@ -424,13 +425,14 @@ async def chat_completions_v1(request: ChatCompletionRequest,
     )
 
     def create_stream_response_json(index: int,
-                                    text: str,
+                                    text: Optional[str],
+                                    tool_calls: List[DeltaToolCall],
                                     finish_reason: Optional[str] = None,
                                     logprobs: Optional[LogProbs] = None,
                                     usage: Optional[UsageInfo] = None) -> str:
         choice_data = ChatCompletionResponseStreamChoice(
             index=index,
-            delta=DeltaMessage(role='assistant', content=text),
+            delta=DeltaMessage(role='assistant', content=text, tool_calls=tool_calls),
             finish_reason=finish_reason,
             logprobs=logprobs)
         response = ChatCompletionStreamResponse(
@@ -445,6 +447,8 @@ async def chat_completions_v1(request: ChatCompletionRequest,
         return response_json
 
     async def completion_stream_generator() -> AsyncGenerator[str, None]:
+        streaming_tool_state = StreamingToolState()
+        tool_call_index = 0
         async for res in result_generator:
             logprobs, usage = None, None
             if gen_logprobs and res.logprobs:
@@ -461,10 +465,44 @@ async def chat_completions_v1(request: ChatCompletionRequest,
                     completion_tokens=res.generate_token_len,
                     total_tokens=total_tokens,
                 )
+            tool_calls = []
+            text = res.response
+            finish_reason = res.finish_reason
+            if request.tool_choice != 'none':
+                parser_output = VariableInterface.async_engine.parse_tool_response_streaming(  # noqa
+                    streaming_tool_state, text, request.tools, finish_reason)
+                if parser_output["type"] == "message":
+                    text = parser_output["delta"]
+                if parser_output["type"] == "name":
+                    tool_calls.append(
+                        DeltaToolCall(
+                            index=tool_call_index,
+                            function=DeltaFunctionCall(
+                                name=parser_output["name"]
+                            )
+                        )
+                    )
+                    text = None
+                if parser_output["type"] == "params":
+                    tool_calls.append(
+                        DeltaToolCall(
+                            index=tool_call_index,
+                            function=DeltaFunctionCall(
+                                arguments=parser_output["params"]
+                            )
+                        )
+                    )
+                    text = None
+                if parser_output["type"] == "end":
+                    finish_reason = "tool_calls"
+                    tool_call_index += 1
+                if parser_output["type"] == "continue":
+                    continue
             response_json = create_stream_response_json(
                 index=0,
-                text=res.response,
-                finish_reason=res.finish_reason,
+                text=text,
+                tool_calls=tool_calls,
+                finish_reason=finish_reason,
                 logprobs=logprobs,
                 usage=usage)
             yield f'data: {response_json}\n\n'

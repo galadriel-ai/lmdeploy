@@ -4,6 +4,7 @@ import dataclasses
 import json
 import os
 import random
+from enum import Enum
 from contextlib import asynccontextmanager
 from copy import deepcopy
 from itertools import count
@@ -98,6 +99,33 @@ class Session:
                 user = str(user)
             res += f'USER:\n{user}\nASSISTANT:\n{assistant}\n'
         return res
+
+
+INTERNLM2_ACTION_START = "<|action_start|><|plugin|>"
+INTERNLM2_ACTION_END = "<|action_end|>"
+LLAMA_FUNCTION_START = "<function="
+LLAMA_FUNCTION_END = "</function>"
+
+
+class StreamingToolFormat(Enum):
+    INTERNLM2 = "internlm2"
+    LLAMA = "llama"
+
+
+@dataclasses.dataclass
+class StreamingToolState:
+    format: Optional[StreamingToolFormat] = None
+    tool_id: Optional[int] = None
+    function_name: Optional[str] = None
+    old_params : str = ""
+    params: str = ""
+    in_params: bool = False
+    ending: bool = False
+    text: str = ""
+    completion_tokens: int = 0
+    
+    def reset(self):
+        self.__init__()
 
 
 class AsyncEngine(LogitsMixin):
@@ -655,6 +683,129 @@ class AsyncEngine(LogitsMixin):
             raise RuntimeError(f'Unexpected model response: {text}')
         action_id = [tool.function.name for tool in tools].index(name)
         return text, action_id, name, parameters
+
+
+    def parse_tool_response_streaming(self, state: StreamingToolState, delta: str, tools, finish_reason: Optional[str], **kwargs) -> dict:
+        INTERNLM2_ACTION_START = "<|action_start|><|plugin|>"
+        LLAMA_FUNCTION_START = "<function="
+        LLAMA_FUNCTION_END = "</function>"
+
+        text = state.text + delta
+        state.completion_tokens += 1
+
+        def is_valid_prefix(text: str) -> bool:
+            return any(tag.startswith(text) for tag in [LLAMA_FUNCTION_START, INTERNLM2_ACTION_START])
+
+        def determine_format() -> dict:
+            if is_valid_prefix(text):
+                # Accumulate until we can fully determine the format
+                state.text = text
+                return {"type": "continue"}
+            if text.startswith(LLAMA_FUNCTION_START):
+                state.format = StreamingToolFormat.LLAMA
+            elif text.startswith(INTERNLM2_ACTION_START):
+                state.format = StreamingToolFormat.INTERNLM2
+            else:
+                state.reset()
+                return {"type": "message", "delta": text}
+
+            # identified the format, continue to function name
+            state.text = text
+            return {"type": "continue"}
+
+        def extract_function_name() -> dict:
+            if state.format == StreamingToolFormat.LLAMA:
+                if ">" in text:
+                    try:
+                        state.function_name, params = text.split(LLAMA_FUNCTION_START)[1].split(">", 1)
+                        state.text = text
+                        state.in_params = True
+                        state.params = params
+                        return {"type": "name", "name": state.function_name}
+                    except ValueError:
+                        pass  # Incomplete function name, continue accumulating
+
+            elif state.format == StreamingToolFormat.INTERNLM2:
+                if "," in text:
+                    try:
+                        partial_json = text.split(INTERNLM2_ACTION_START)[1].replace(",", "}")
+                        action = json.loads(partial_json)
+                        state.function_name = action.get("name")
+                        state.old_params = ""
+                        state.in_params = True
+                        return {"type": "name", "name": state.function_name}
+                    except (json.JSONDecodeError, KeyError):
+                        pass  # Invalid JSON, continue accumulating
+
+            state.text = text
+            return {"type": "continue"}
+
+        def process_params() -> dict:
+            nonlocal delta
+            state.old_params = state.params
+            state.params += delta
+            if state.format == StreamingToolFormat.LLAMA:
+                if delta == "</":
+                    state.in_params = False
+                    state.ending = True
+                    state.params = ""
+                    state.text = delta # start accumulating only the end tag
+                    return {"type": "continue"}
+                # Accumulate parameters
+                return {"type": "params", "params": delta}
+            elif state.format == StreamingToolFormat.INTERNLM2:
+                if state.params.startswith(' "parameters": '):
+                    old_params = state.old_params[15:]
+                    new_params = state.params[15:]
+                    delta = new_params[len(old_params):]
+                    try:
+                        json.loads(state.params[15:][:-1])
+                        state.in_params = False
+                        state.ending = True
+                        state.params = ""
+                        state.text = ""
+                        delta = "\"}" # remove the last }
+                    except:
+                        # we still need to collect the params
+                        pass
+                    finally:
+                        return {"type": "params", "params": delta}
+                elif len(state.params) < 15:
+                    # we still need to collect the params
+                    return {"type": "continue"}
+                else:
+                    # something is wrong, bail out
+                    state.reset()
+                    return {"type": "message", "delta": text}
+
+        def process_ending() -> dict:
+            if state.format == StreamingToolFormat.LLAMA:
+                if text.startswith(LLAMA_FUNCTION_END) and finish_reason:
+                    state.reset()
+                    return {"type": "end", "finish_reason": "tool_calls"}
+            elif state.format == StreamingToolFormat.INTERNLM2:
+                if finish_reason:
+                    state.reset()
+                    return {"type": "end", "finish_reason": "tool_calls"}
+            state.text = text
+            return {"type": "continue"}
+
+        if state.format is None:
+            return determine_format()
+
+        if state.function_name is None:
+            return extract_function_name()
+
+        if state.in_params:
+            return process_params()
+
+        if state.ending:
+            return process_ending()
+
+        response = {"type": "message", "delta": text}
+        state.reset()
+        return response
+
 
     def chat(self,
              prompt: str,
